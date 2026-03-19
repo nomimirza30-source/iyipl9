@@ -90,21 +90,36 @@ async def ingest_bank_statement(
     
     headers = reader.fieldnames if reader.fieldnames else []
     
-    # 1. Date
-    date_col = next((col for col in headers if col.strip().lower() == 'date'), None)
-    # 2. Description
-    desc_col = next((col for col in headers if col.strip().lower() in ('description', 'reference')), None)
-    # 3. Amount
-    amount_col = next((col for col in headers if col.strip().lower() == 'amount'), None)
-    paid_in_col = next((col for col in headers if col.strip().lower() == 'paid in'), None)
-    paid_out_col = next((col for col in headers if col.strip().lower() == 'paid out'), None)
+    def get_col(candidates):
+        for header in headers:
+            if header.strip().lower() in candidates:
+                return header
+        return None
+
+    # Date candidates
+    date_col = get_col(['date', 'created on'])
+    
+    # Description candidates
+    desc_cols = [col for col in headers if col.strip().lower() in (
+        'description', 'transaction description', 'reference', 'target name', 'source name', 'note'
+    )]
+    
+    # Amount candidates
+    amount_col = get_col(['amount', 'amount in gbp'])
+    paid_in_col = get_col(['paid in'])
+    paid_out_col = get_col(['paid out'])
+    wise_amount_col = get_col(['source amount (after fees)'])
+    wise_direction_col = get_col(['direction'])
 
     if not date_col:
-        raise HTTPException(status_code=400, detail="CSV must contain a 'Date' column.")
-    if not desc_col:
-        raise HTTPException(status_code=400, detail="CSV must contain a 'Description' or 'Reference' column.")
-    if not amount_col and not (paid_in_col or paid_out_col):
-        raise HTTPException(status_code=400, detail="CSV must contain either an 'Amount' column, or 'Paid In' / 'Paid Out' columns.")
+        raise HTTPException(status_code=400, detail="CSV must contain a Date column ('Date' or 'Created on').")
+    if not desc_cols:
+        raise HTTPException(status_code=400, detail="CSV must contain a Description column.")
+    if not amount_col and not (paid_in_col or paid_out_col) and not (wise_amount_col and wise_direction_col):
+        raise HTTPException(
+            status_code=400, 
+            detail="CSV must contain Amount columns ('Amount', 'Paid In/Out', or Wise 'Direction' & 'Source amount')."
+        )
 
     # Ensure accounts exist
     cash_acc = _get_or_create_account(db, "Cash", AccountTypeEnum.ASSET, company_id)
@@ -114,33 +129,59 @@ async def ingest_bank_statement(
     user_id = claims.get("user_id", 1)
     processed_count = 0
 
+    def clean_float(valstr):
+        if not valstr: return 0.0
+        try:
+            return float(valstr.strip().replace('"', '').replace(',', ''))
+        except ValueError:
+            return 0.0
+
     for row in reader:
         amount = 0.0
+        
+        # 1. Standard Amount column
         if amount_col and row.get(amount_col):
-            try:
-                amount = float(row[amount_col].strip().replace(",", ""))
-            except ValueError:
-                pass
-        else:
-            in_val = 0.0
-            out_val = 0.0
-            if paid_in_col and row.get(paid_in_col):
-                try: in_val = float(row[paid_in_col].strip().replace(",", ""))
-                except ValueError: pass
-            if paid_out_col and row.get(paid_out_col):
-                try: out_val = float(row[paid_out_col].strip().replace(",", ""))
-                except ValueError: pass
+            amount = clean_float(row[amount_col])
             
+        # 2. Paid In / Paid Out (Tide)
+        elif paid_in_col or paid_out_col:
+            in_val = clean_float(row.get(paid_in_col))
+            out_val = clean_float(row.get(paid_out_col))
             if in_val != 0:
                 amount = abs(in_val)
             elif out_val != 0:
                 amount = -abs(out_val)
+                
+        # 3. Wise Format (Direction + Source amount)
+        elif wise_amount_col and wise_direction_col:
+            source_amount = clean_float(row.get(wise_amount_col))
+            direction = row.get(wise_direction_col, "").strip().upper()
+            if direction == 'IN':
+                amount = abs(source_amount)
+            elif direction == 'OUT':
+                amount = -abs(source_amount)
 
         if amount == 0:
             continue
 
-        desc = row.get(desc_col, "").strip()
+        # Build Description from available columns
+        desc_parts = []
+        for dcol in desc_cols:
+            val = row.get(dcol, "").strip()
+            if val and val not in desc_parts:
+                desc_parts.append(val)
+        desc = " | ".join(desc_parts) if desc_parts else "Bank Transaction"
+        
+        # Wise 'Status' check to avoid importing refunded/failed transactions
+        status_col = get_col(['status'])
+        if status_col:
+            status_val = row.get(status_col, "").strip().upper()
+            if status_val in ['REFUNDED', 'CANCELLED', 'FAILED']:
+                continue
+
         date_str = row.get(date_col, "").strip()
+        # Clean quotes from date if any
+        date_str = date_str.replace('"', '')
         
         # Determine Sales (incoming) or Expense (outgoing)
         if amount > 0:
@@ -158,7 +199,7 @@ async def ingest_bank_statement(
             ]
             
         transaction_data = TransactionCreate(
-            description=f"{desc} (CSV Import - {date_str})",
+            description=f"{desc} (CSV Import - {date_str})"[0:255], # Truncate to avoid DB length limits if combined desc is massive
             entries=entries
         )
         

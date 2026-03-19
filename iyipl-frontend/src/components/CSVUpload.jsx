@@ -91,7 +91,7 @@ const CSVUpload = ({ token, onUploadSuccess }) => {
             </div>
 
             <div className="mt-4 text-sm text-muted">
-                <strong>Supported CSV Columns:</strong> <code>Date</code>, <code>Description</code> (or <code>Reference</code>), <code>Amount</code> (or <code>Paid In</code> &amp; <code>Paid Out</code>)
+                <strong>Supported Formats:</strong> Compatible with standard CSVs as well as native <strong>Mettle</strong>, <strong>Tide</strong>, and <strong>Wise</strong> exports.
             </div>
 
             {message && (
